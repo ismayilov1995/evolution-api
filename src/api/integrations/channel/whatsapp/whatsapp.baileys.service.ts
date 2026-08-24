@@ -1416,7 +1416,17 @@ export class BaileysStartupService extends ChannelStartupService {
                       mediaType,
                       `${Date.now()}_${fileName}`,
                     );
-                    await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
+                    const uploadResult = await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, {
+                      'Content-Type': mimetype,
+                    });
+
+                    // uploadFile resolves with the Error instead of throwing
+                    // (see minio.server.ts — a throw would break sqs.controller's
+                    // bare call and abort the rest of EventManager.emit). Rethrow
+                    // here so the catch below handles it and, critically, so the
+                    // Media row and presigned URL below are never written for an
+                    // object that isn't in the bucket.
+                    if (uploadResult instanceof Error) throw uploadResult;
 
                     await this.prismaRepository.media.create({
                       data: {
@@ -1740,7 +1750,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       groupMetadataUpdate.forEach((group) => {
         if (isJidGroup(group.id)) {
-          this.updateGroupMetadataCache(group.id);
+          this.invalidateGroupMetadataCache(group.id);
         }
       });
     },
@@ -2491,7 +2501,14 @@ export class BaileysStartupService extends ChannelStartupService {
                 fileName,
               );
 
-              await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
+              const uploadResult = await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, {
+                'Content-Type': mimetype,
+              });
+
+              // Same contract as the inbound path above: a failed upload must
+              // not leave a Media row pointing at an object that was never
+              // stored.
+              if (uploadResult instanceof Error) throw uploadResult;
 
               await this.prismaRepository.media.create({
                 data: { messageId: msg.id, instanceId: this.instanceId, type: mediaType, fileName: fullName, mimetype },
@@ -4298,7 +4315,61 @@ export class BaileysStartupService extends ChannelStartupService {
       return meta;
     } catch (error) {
       this.logger.error(error);
+
+      // A failed refresh must still advance the cached timestamp. Without this
+      // the entry stays stale, so the very next message for this group fires
+      // another refresh, which fails again — a feedback loop that turns a
+      // single WhatsApp rate-limit into a sustained storm (1793 rate-overlimit
+      // errors in three hours on 2026-08-24, against ~150 group msgs/hour).
+      // Backing off means serving group metadata up to an hour stale, which is
+      // harmless; sustaining the storm risks the WhatsApp account itself.
+      try {
+        const cacheConf = this.configService.get<CacheConf>('CACHE');
+
+        if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
+          const existing = await groupMetadataCache.get(groupJid);
+
+          if (existing?.data) {
+            await groupMetadataCache.set(groupJid, { timestamp: Date.now(), data: existing.data });
+          }
+        }
+      } catch (backoffError) {
+        this.logger.error(backoffError);
+      }
+
       return null;
+    }
+  }
+
+  // Mark a cached group entry stale rather than refetching it immediately.
+  //
+  // The 'groups.update' handler used to call updateGroupMetadataCache() for
+  // every group in the batch, unawaited and unthrottled. WhatsApp sends bulk
+  // groups.update batches on reconnect, so across ~500 groups that put
+  // hundreds of groupMetadata() queries on the wire at once and tripped
+  // WhatsApp's rate limiter — the event that ignited the rate-overlimit
+  // storms this cache is now defended against.
+  //
+  // Zeroing the timestamp hands the work to getGroupMetadataCache's existing
+  // lazy path: the next message for that group triggers a single refresh, and
+  // the previous copy is still served meanwhile, so Baileys never receives
+  // null and never fetches the metadata itself. Requests end up spread across
+  // message arrival instead of bursting on reconnect. If that refresh fails,
+  // updateGroupMetadataCache's catch block advances the timestamp and the
+  // group backs off for an hour.
+  private async invalidateGroupMetadataCache(groupJid: string) {
+    try {
+      const cacheConf = this.configService.get<CacheConf>('CACHE');
+
+      if ((cacheConf?.REDIS?.ENABLED && cacheConf?.REDIS?.URI !== '') || cacheConf?.LOCAL?.ENABLED) {
+        const existing = await groupMetadataCache.get(groupJid);
+
+        if (existing?.data) {
+          await groupMetadataCache.set(groupJid, { timestamp: 0, data: existing.data });
+        }
+      }
+    } catch (error) {
+      this.logger.error(error);
     }
   }
 
