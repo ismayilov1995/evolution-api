@@ -16,13 +16,17 @@ const fixFileName = (file: string): string | undefined => {
   return replacedColon;
 };
 
-export async function keyExists(sessionId: string): Promise<any> {
-  try {
-    const key = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
-    return !!key;
-  } catch {
-    return false;
-  }
+/**
+ * Whether a session row exists.
+ *
+ * Throws on a read failure instead of reporting "no session". The two are not
+ * the same thing and treating them as one destroys live sessions: the caller
+ * answers "no session" by generating fresh credentials and writing them over
+ * the row it just failed to read.
+ */
+export async function keyExists(sessionId: string): Promise<boolean> {
+  const key = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
+  return !!key;
 }
 
 export async function saveKey(sessionId: string, keyJson: any): Promise<any> {
@@ -44,15 +48,21 @@ export async function saveKey(sessionId: string, keyJson: any): Promise<any> {
   }
 }
 
+/**
+ * The stored credentials, or null ONLY when no session row exists.
+ *
+ * A database error propagates. Swallowing it here is what cost two live
+ * WhatsApp sessions on 2026-08-25: the box was deep into swap, a read did not
+ * come back in time, this returned null, and the bootstrap below overwrote
+ * both working sessions with freshly generated, unpaired credentials — with
+ * no log line, because the error had already been discarded.
+ */
 export async function getAuthKey(sessionId: string): Promise<any> {
-  try {
-    const register = await keyExists(sessionId);
-    if (!register) return null;
-    const auth = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
-    return JSON.parse(auth?.creds);
-  } catch {
-    return null;
-  }
+  const register = await keyExists(sessionId);
+  if (!register) return null;
+  const auth = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
+  if (!auth?.creds) return null;
+  return JSON.parse(auth.creds);
 }
 
 async function deleteAuthKey(sessionId: string): Promise<any> {
@@ -121,9 +131,15 @@ export default async function useMultiFileAuthStatePrisma(
         rawData = await getAuthKey(sessionId);
       }
 
+      if (rawData === null || rawData === undefined) return null;
       const parsedData = JSON.parse(rawData, BufferJSON.reviver);
       return parsedData;
-    } catch {
+    } catch (error) {
+      // Signal keys may legitimately be missing and null is the right answer
+      // for them. Credentials are different: null here is read as "this
+      // instance was never paired", and the caller acts on that by replacing
+      // the stored session. A failed read must therefore propagate.
+      if (key === 'creds') throw error;
       return null;
     }
   }
@@ -166,8 +182,24 @@ export default async function useMultiFileAuthStatePrisma(
     await deleteAuthKey(sessionId);
   }
 
-  let creds = await readData('creds');
+  // Only ever generate a new identity when the store confirms there is none.
+  // If reading fails we let the error out: the caller reconnects on its own,
+  // and a session that could not be read is left exactly as it was rather
+  // than being replaced by an unpaired one.
+  let creds;
+  try {
+    creds = await readData('creds');
+  } catch (error) {
+    logger.error({
+      action: 'auth.creds.read.failed',
+      sessionId,
+      warn: 'Refusing to re-initialise credentials — the existing session is left untouched.',
+      error,
+    });
+    throw error;
+  }
   if (!creds) {
+    logger.info({ action: 'auth.creds.init', sessionId, note: 'no stored session — pairing from scratch' });
     creds = initAuthCreds();
     await writeData(creds, 'creds');
   }
