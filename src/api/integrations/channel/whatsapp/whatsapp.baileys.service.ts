@@ -164,6 +164,38 @@ export interface ExtendedIMessageKey extends proto.IMessageKey {
 
 const groupMetadataCache = new CacheService(new CacheEngine(configService, 'groups').getEngine());
 
+/**
+ * Stub reasons that mean "WhatsApp delivered a message we could not read".
+ *
+ * Baileys emits a stub instead of a message when Signal decryption fails, and
+ * has by then already exhausted its own retries and asked the sender's device
+ * to resend (maxMsgRetryCount / requestPlaceholderResend in the socket config).
+ * So a stub carrying one of these is the residue after recovery failed, not a
+ * message still in flight.
+ */
+const UNDECRYPTABLE_STUB_REASONS = [
+  'No matching sessions found for message',
+  'Bad MAC',
+  'failed to decrypt message',
+  'SessionError',
+  'Invalid PreKey ID',
+  'No session record',
+  'No session found to decrypt message',
+  'Message absent from node',
+];
+
+/** messageType of the row that stands in for a message we could not decrypt. */
+const UNDECRYPTABLE_MESSAGE_TYPE = 'undecryptable';
+
+/**
+ * Marks key ids that currently have a placeholder standing in for them, so the
+ * cleanup on the ingest path can skip Postgres for every normal message.
+ * A day is far longer than any resend takes; an expired marker only means a
+ * placeholder outlives the message it stood in for.
+ */
+const UNDECRYPTABLE_CACHE_PREFIX = 'undecryptable_';
+const UNDECRYPTABLE_CACHE_TTL_SECONDS = 60 * 60 * 24;
+
 // Adicione a função getVideoDuration no início do arquivo
 async function getVideoDuration(input: Buffer | string | Readable): Promise<number> {
   const MediaInfoFactory = (await import('mediainfo.js')).default;
@@ -1085,23 +1117,16 @@ export class BaileysStartupService extends ChannelStartupService {
     ) => {
       try {
         for (const received of messages) {
-          if (
-            received?.messageStubParameters?.some?.((param) =>
-              [
-                'No matching sessions found for message',
-                'Bad MAC',
-                'failed to decrypt message',
-                'SessionError',
-                'Invalid PreKey ID',
-                'No session record',
-                'No session found to decrypt message',
-                'Message absent from node',
-              ].some((err) => param?.includes?.(err)),
-            )
-          ) {
-            this.logger.warn(`Message ignored with messageStubParameters: ${JSON.stringify(received, null, 2)}`);
+          const undecryptableReason = received?.messageStubParameters?.find?.((param) =>
+            UNDECRYPTABLE_STUB_REASONS.some((err) => param?.includes?.(err)),
+          );
+
+          if (undecryptableReason) {
+            await this.recordUndecryptableMessage(received, undecryptableReason);
             continue;
           }
+
+          await this.clearUndecryptablePlaceholder(received);
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {
             const text = received.message?.conversation || received.message?.extendedTextMessage?.text;
 
@@ -4718,6 +4743,101 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return obj;
+  }
+
+  /**
+   * Keeps a message we could not decrypt visible instead of dropping it.
+   *
+   * WHY A ROW AND NOT JUST A LOG. This used to `continue` after a warn line.
+   * The message was gone from every consumer of the Message table — the chat
+   * view showed nothing, and reply-time metrics concluded the customer never
+   * wrote, so a conversation could sit "answered" while a real question went
+   * unread. Nobody could tell, because the absence looked exactly like silence.
+   *
+   * A placeholder is uglier to look at and far easier to reason about: the
+   * conversation keeps its true shape, the gap is attributable, and anything
+   * that wants only real messages filters on `messageType`.
+   *
+   * The text goes in `conversation` on purpose — every reader already falls
+   * back to that field, so existing views surface the placeholder without
+   * changing a line.
+   *
+   * Never throws: failing to record one message must not abort the batch.
+   */
+  private async recordUndecryptableMessage(received: WAMessage, reason: string) {
+    this.logger.warn(`Undecryptable message (${reason}): ${JSON.stringify(received?.key)}`);
+
+    if (!this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) return;
+    if (!received?.key?.id || !received?.key?.remoteJid) return;
+
+    try {
+      // The resend may have won the race and already landed. Writing anyway
+      // would leave a placeholder sitting in front of the real message.
+      const existing = await this.prismaRepository.message.findFirst({
+        where: { instanceId: this.instanceId, key: { path: ['id'], equals: received.key.id } },
+        select: { id: true },
+      });
+      if (existing) return;
+
+      const messageTimestamp = Long.isLong(received.messageTimestamp)
+        ? received.messageTimestamp.toNumber()
+        : ((received.messageTimestamp as number) ?? Math.floor(Date.now() / 1000));
+
+      await this.prismaRepository.message.create({
+        data: {
+          key: received.key as any,
+          pushName: received.pushName ?? null,
+          message: { conversation: `[şifrələnmiş mesaj açıla bilmədi: ${reason}]` },
+          messageType: UNDECRYPTABLE_MESSAGE_TYPE,
+          messageTimestamp,
+          instanceId: this.instanceId,
+          status: status[3], // DELIVERED: it reached us, we just could not read it
+          source: getDevice(received.key.id),
+        },
+      });
+
+      await this.baileysCache.set(
+        `${UNDECRYPTABLE_CACHE_PREFIX}${received.key.id}`,
+        true,
+        UNDECRYPTABLE_CACHE_TTL_SECONDS,
+      );
+    } catch (error) {
+      this.logger.error(`Failed to record undecryptable message: ${error}`);
+    }
+  }
+
+  /**
+   * Removes the placeholder once the real message arrives.
+   *
+   * WhatsApp resends after a failed decryption, so the same key can turn up
+   * again minutes later — now readable. Leaving both rows would show the
+   * apology next to the message it apologises for, and double-count the
+   * conversation in every per-message metric.
+   *
+   * Gated on a cache marker rather than querying every message: undecryptable
+   * messages are rare (single digits per day here) and this runs on the hot
+   * ingest path, so the common case must not touch Postgres at all. The marker
+   * lives in Redis alongside the other Baileys dedupe keys, so it survives a
+   * restart the way an in-process Set would not.
+   */
+  private async clearUndecryptablePlaceholder(received: WAMessage) {
+    if (!received?.key?.id) return;
+
+    const cacheKey = `${UNDECRYPTABLE_CACHE_PREFIX}${received.key.id}`;
+    if (!(await this.baileysCache.get(cacheKey))) return;
+
+    try {
+      await this.prismaRepository.message.deleteMany({
+        where: {
+          instanceId: this.instanceId,
+          messageType: UNDECRYPTABLE_MESSAGE_TYPE,
+          key: { path: ['id'], equals: received.key.id },
+        },
+      });
+      await this.baileysCache.delete(cacheKey);
+    } catch (error) {
+      this.logger.error(`Failed to clear undecryptable placeholder: ${error}`);
+    }
   }
 
   private prepareMessage(message: proto.IWebMessageInfo): any {
