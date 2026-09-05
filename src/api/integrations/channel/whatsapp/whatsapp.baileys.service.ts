@@ -189,12 +189,17 @@ const UNDECRYPTABLE_MESSAGE_TYPE = 'undecryptable';
 
 /**
  * Marks key ids that currently have a placeholder standing in for them, so the
- * cleanup on the ingest path can skip Postgres for every normal message.
- * A day is far longer than any resend takes; an expired marker only means a
- * placeholder outlives the message it stood in for.
+ * cleanup on the ingest path can skip the database for every normal message.
+ *
+ * The TTL is deliberately far longer than any resend takes. It matters because
+ * this database carries a unique index on (instanceId, key->>'id'): if the
+ * marker were gone when the real message finally arrived, its insert would hit
+ * that constraint, get swallowed by the surrounding catch, and leave the
+ * placeholder standing in for a message we could by then actually read. The
+ * bulk history-sync path guards the same collision separately.
  */
 const UNDECRYPTABLE_CACHE_PREFIX = 'undecryptable_';
-const UNDECRYPTABLE_CACHE_TTL_SECONDS = 60 * 60 * 24;
+const UNDECRYPTABLE_CACHE_TTL_SECONDS = 60 * 60 * 24 * 7;
 
 // Adicione a função getVideoDuration no início do arquivo
 async function getVideoDuration(input: Buffer | string | Readable): Promise<number> {
@@ -1084,6 +1089,13 @@ export class BaileysStartupService extends ChannelStartupService {
         });
 
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
+          // A history sync can carry the readable copy of something we could
+          // only store as a placeholder (recordUndecryptableMessage). Because
+          // this database has a unique index on (instanceId, key->>'id'),
+          // `skipDuplicates` would keep the placeholder and silently discard
+          // the real message. One bulk delete per batch clears the way.
+          await this.dropUndecryptablePlaceholders(messagesRaw.map((m) => m?.key?.id));
+
           await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
         }
 
@@ -4803,6 +4815,36 @@ export class BaileysStartupService extends ChannelStartupService {
       );
     } catch (error) {
       this.logger.error(`Failed to record undecryptable message: ${error}`);
+    }
+  }
+
+  /**
+   * Bulk counterpart of {@link clearUndecryptablePlaceholder}, for history sync.
+   *
+   * Reads the instance's placeholders first and intersects in memory rather
+   * than building a filter over the batch: a sync batch holds thousands of
+   * ids, while placeholders number in the single digits, so the small side is
+   * the one worth sending to the database. It also keeps the query free of
+   * JSON-path filtering, which differs between the PostgreSQL and MySQL
+   * schemas this project supports.
+   */
+  private async dropUndecryptablePlaceholders(keyIds: (string | undefined)[]) {
+    const wanted = new Set(keyIds.filter(Boolean));
+    if (!wanted.size) return;
+
+    try {
+      const placeholders = await this.prismaRepository.message.findMany({
+        where: { instanceId: this.instanceId, messageType: UNDECRYPTABLE_MESSAGE_TYPE },
+        select: { id: true, key: true },
+      });
+
+      const stale = placeholders.filter((p) => wanted.has((p.key as any)?.id)).map((p) => p.id);
+      if (!stale.length) return;
+
+      await this.prismaRepository.message.deleteMany({ where: { id: { in: stale } } });
+      this.logger.info(`Replaced ${stale.length} undecryptable placeholder(s) with synced messages`);
+    } catch (error) {
+      this.logger.error(`Failed to drop undecryptable placeholders: ${error}`);
     }
   }
 
