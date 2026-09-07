@@ -48,6 +48,18 @@ nömrəsinin qoşulmasının itməsi və yenidən QR oxutmaq deməkdir.
 Uğursuz media yükləmələri təkrar cəhd edir; qrup metadata yeniləməsi isə
 geri-çəkilmə (backoff) ilə işləyir ki, çoxlu qrupda WhatsApp limitinə dəyməsin.
 
+## Klonlayarkən
+
+Repoda `evolution-manager-v2` submodulu var (idarəetmə paneli, ayrıca açıq
+repodur) və bu maşında **yüklənməyib** — API onsuz tam işləyir. Lazım olsa:
+
+```bash
+git submodule update --init --recursive
+```
+
+Lazım deyilsə heç nə etməyin; `npm install` və `npm run build` submoduldan asılı
+deyil.
+
 ---
 
 ## Upstream ilə sinxron qalmaq
