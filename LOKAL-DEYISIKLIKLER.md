@@ -1,7 +1,7 @@
 # Bu fork upstream-dən nə ilə fərqlənir
 
 Bu repo [Evolution API](https://github.com/EvolutionAPI/evolution-api)-nin
-forkudur. Yuxarı axından (upstream) fərqi **4 commit**-dir; hamısı canlı
+forkudur. Yuxarı axından (upstream) fərqi **5 commit**-dir; hamısı canlı
 istifadədə üzə çıxan və hər biri **səssiz** işləyən nasazlıqların düzəlişidir.
 Aşağıdakı üçü ona görə vacibdir ki, üçü də xəta çıxarmır — sadəcə məlumat itir.
 
@@ -47,6 +47,29 @@ nömrəsinin qoşulmasının itməsi və yenidən QR oxutmaq deməkdir.
 
 Uğursuz media yükləmələri təkrar cəhd edir; qrup metadata yeniləməsi isə
 geri-çəkilmə (backoff) ilə işləyir ki, çoxlu qrupda WhatsApp limitinə dəyməsin.
+
+## 4. Media mərhələsi webhook-u saxlamır
+
+`src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts` —
+`uploadReceivedMediaWithDeadline` / `uploadReceivedMedia`
+
+`messages.upsert` mediasını S3-ə yükləyir və webhook-u yalnız bu iş bitəndən
+sonra göndərirdi. 2026-09-13-də satıcıların öz telefonundan göndərdiyi media
+(fromMe) əksər hallarda `mediaUrl` almırdı (bir instansda restartdan bəri 74-dən
+68-i). Bu hallarda handler bazaya yazma ilə webhook arasında heç nə loglamadan
+dayanırdı: Katibe mesajı yalnız sonrakı trafiklə və ya 5 dəqiqəlik cron ilə
+görürdü. Harada dayandığı hələ bilinmir.
+
+İndi media mərhələsinin vaxt həddi var: `S3_MEDIA_STAGE_TIMEOUT_MS`, default
+60 000. Vaxt keçəndə webhook `mediaUrl`-siz gedir, jurnala isə WARN yazılır:
+`Media upload still pending after …ms at stage "download|upload|db"`. İş sonradan
+bitərsə, «finished late» qeydi düşür. Upstream-dəki iki `return` (video
+söndürülüb, mesajda media yoxdur) bütün handler-dən çıxırdı. Bu da webhook-u və
+dəstədəki qalan mesajları buraxırdı. İndi onlar yalnız bu metoddan çıxır.
+
+`getBase64FromMediaMessage`-də Baileys-ə verilən logger səviyyəsi `info`-dur,
+ona görə «sending reupload media request…» görünür. Bu gözləmənin öz vaxt həddi
+yoxdur.
 
 ## Klonlayarkən
 

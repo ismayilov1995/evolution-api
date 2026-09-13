@@ -1350,8 +1350,6 @@ export class BaileysStartupService extends ChannelStartupService {
             received?.message?.ptvMessage ||
             received?.message?.audioMessage;
 
-          const isVideo = received?.message?.videoMessage;
-
           if (this.localSettings.readMessages && received.key.id !== 'status@broadcast') {
             await this.client.readMessages([received.key]);
           }
@@ -1421,70 +1419,8 @@ export class BaileysStartupService extends ChannelStartupService {
               this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
             }
 
-            if (isMedia) {
-              if (this.configService.get<S3>('S3').ENABLE) {
-                try {
-                  if (isVideo && !this.configService.get<S3>('S3').SAVE_VIDEO) {
-                    this.logger.warn('Video upload is disabled. Skipping video upload.');
-                    // Skip video upload by returning early from this block
-                    return;
-                  }
-
-                  const message: any = received;
-
-                  // Verificação adicional para garantir que há conteúdo de mídia real
-                  const hasRealMedia = this.hasValidMediaContent(message);
-
-                  if (!hasRealMedia) {
-                    this.logger.warn('Message detected as media but contains no valid media content');
-                  } else {
-                    const media = await this.getBase64FromMediaMessage({ message }, true);
-
-                    if (!media) {
-                      this.logger.verbose('No valid media to upload (messageContextInfo only), skipping MinIO');
-                      return;
-                    }
-
-                    const { buffer, mediaType, fileName, size } = media;
-                    const mimetype = mimeTypes.lookup(fileName).toString();
-                    const fullName = join(
-                      `${this.instance.id}`,
-                      received.key.remoteJid,
-                      mediaType,
-                      `${Date.now()}_${fileName}`,
-                    );
-                    const uploadResult = await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, {
-                      'Content-Type': mimetype,
-                    });
-
-                    // uploadFile resolves with the Error instead of throwing
-                    // (see minio.server.ts — a throw would break sqs.controller's
-                    // bare call and abort the rest of EventManager.emit). Rethrow
-                    // here so the catch below handles it and, critically, so the
-                    // Media row and presigned URL below are never written for an
-                    // object that isn't in the bucket.
-                    if (uploadResult instanceof Error) throw uploadResult;
-
-                    await this.prismaRepository.media.create({
-                      data: {
-                        messageId: msg.id,
-                        instanceId: this.instanceId,
-                        type: mediaType,
-                        fileName: fullName,
-                        mimetype,
-                      },
-                    });
-
-                    const mediaUrl = await s3Service.getObjectUrl(fullName);
-
-                    messageRaw.message.mediaUrl = mediaUrl;
-
-                    await this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw });
-                  }
-                } catch (error) {
-                  this.logger.error(['Error on upload file to minio', error?.message, error?.stack]);
-                }
-              }
+            if (isMedia && this.configService.get<S3>('S3').ENABLE) {
+              await this.uploadReceivedMediaWithDeadline(received, msg.id, messageRaw);
             }
           }
 
@@ -3954,7 +3890,9 @@ export class BaileysStartupService extends ChannelStartupService {
           { key: msg?.key, message: msg?.message },
           'buffer',
           {},
-          { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+          // LOCAL PATCH: 'info', not 'error' — Baileys logs only "sending reupload
+          // media request..." here, and that wait has no timeout of its own.
+          { logger: P({ level: 'info' }) as any, reuploadRequest: this.client.updateMediaMessage },
         );
       } catch {
         this.logger.error('Download Media failed, trying to retry in 5 seconds...');
@@ -4961,6 +4899,119 @@ export class BaileysStartupService extends ChannelStartupService {
         this.chatwootService.syncLostMessages({ instanceName: this.instance.name }, chatwootConfig, prepare);
       });
       task.start();
+    }
+  }
+
+  /*
+   * LOCAL PATCH — the S3 step of messages.upsert, time-boxed.
+   *
+   * Upstream awaited this inline, and the webhook is sent only after it. On
+   * 2026-09-13 media sent from the sellers' own phones (fromMe) mostly never
+   * got a mediaUrl — 68 of 74 on one instance since the last restart — and
+   * for those the handler stopped between the DB insert and the webhook
+   * without logging anything. Consumers only learned about the message from
+   * later traffic or a polling cron: a voice note showed up in Katibe 3
+   * minutes late. Where it stops is not yet known, so this also records the
+   * stage it was in.
+   *
+   * Upstream also `return`ed out of the whole handler (video disabled, or no
+   * media in the message), silently skipping the webhook and every later
+   * message in the batch. Those returns now leave only this method.
+   */
+  private async uploadReceivedMediaWithDeadline(received: any, messageId: string, messageRaw: any): Promise<void> {
+    const deadlineMs = Number(process.env.S3_MEDIA_STAGE_TIMEOUT_MS) || 60_000;
+    const progress = { stage: 'start' };
+    const started = Date.now();
+    const work = this.uploadReceivedMedia(received, messageId, messageRaw, progress);
+
+    let timer: NodeJS.Timeout;
+    const timedOut = await Promise.race([
+      work.then(() => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(true), deadlineMs);
+      }),
+    ]).finally(() => clearTimeout(timer));
+    if (!timedOut) return;
+
+    const tag = `${received.key?.id} fromMe=${received.key?.fromMe} ${messageRaw.messageType}`;
+    this.logger.warn(
+      `Media upload still pending after ${deadlineMs}ms at stage "${progress.stage}" (${tag}); sending webhook without mediaUrl`,
+    );
+    // uploadReceivedMedia never rejects.
+    work.then(() =>
+      this.logger.warn(
+        `Media upload finished late after ${Date.now() - started}ms, stage "${progress.stage}" (${tag})`,
+      ),
+    );
+  }
+
+  private async uploadReceivedMedia(
+    received: any,
+    messageId: string,
+    messageRaw: any,
+    progress: { stage: string },
+  ): Promise<void> {
+    // The row is written from a copy: after a timeout the caller goes on to
+    // rewrite messageRaw.key.remoteJid (@lid -> phone) for the webhook, and a
+    // late finish must not store that in the row.
+    const dbRaw = { ...messageRaw, key: { ...messageRaw.key }, message: { ...messageRaw.message } };
+
+    try {
+      if (received?.message?.videoMessage && !this.configService.get<S3>('S3').SAVE_VIDEO) {
+        this.logger.warn('Video upload is disabled. Skipping video upload.');
+        return;
+      }
+
+      // Verificação adicional para garantir que há conteúdo de mídia real
+      if (!this.hasValidMediaContent(received)) {
+        this.logger.warn('Message detected as media but contains no valid media content');
+        return;
+      }
+
+      progress.stage = 'download';
+      const media = await this.getBase64FromMediaMessage({ message: received }, true);
+
+      if (!media) {
+        this.logger.verbose('No valid media to upload (messageContextInfo only), skipping MinIO');
+        return;
+      }
+
+      const { buffer, mediaType, fileName, size } = media;
+      const mimetype = mimeTypes.lookup(fileName).toString();
+      const fullName = join(`${this.instance.id}`, received.key.remoteJid, mediaType, `${Date.now()}_${fileName}`);
+
+      progress.stage = 'upload';
+      const uploadResult = await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, {
+        'Content-Type': mimetype,
+      });
+
+      // uploadFile resolves with the Error instead of throwing
+      // (see minio.server.ts — a throw would break sqs.controller's
+      // bare call and abort the rest of EventManager.emit). Rethrow
+      // here so the catch below handles it and, critically, so the
+      // Media row and presigned URL below are never written for an
+      // object that isn't in the bucket.
+      if (uploadResult instanceof Error) throw uploadResult;
+
+      progress.stage = 'db';
+      await this.prismaRepository.media.create({
+        data: {
+          messageId,
+          instanceId: this.instanceId,
+          type: mediaType,
+          fileName: fullName,
+          mimetype,
+        },
+      });
+
+      const mediaUrl = await s3Service.getObjectUrl(fullName);
+      messageRaw.message.mediaUrl = mediaUrl;
+      dbRaw.message.mediaUrl = mediaUrl;
+
+      await this.prismaRepository.message.update({ where: { id: messageId }, data: dbRaw });
+      progress.stage = 'done';
+    } catch (error) {
+      this.logger.error([`Error on upload file to minio (stage ${progress.stage})`, error?.message, error?.stack]);
     }
   }
 
