@@ -71,6 +71,27 @@ dəstədəki qalan mesajları buraxırdı. İndi onlar yalnız bu metoddan çıx
 ona görə «sending reupload media request…» görünür. Bu gözləmənin öz vaxt həddi
 yoxdur.
 
+## Nginx qapısı (repodan kənar, `/etc/nginx`)
+
+`evolution.katibe.online` vhost-u Evolution-un açar modelindəki boşluğu bağlayır:
+[auth.guard.ts](src/api/guards/auth.guard.ts) açarı «oxu/yaz» deyə bölmür, ona
+görə kənar tətbiqi `markMessageAsRead`-dən saxlayan yeganə şey nginx-dir.
+
+Blanket qadağalar (hamıya): `^/message/send`, `^/chat/(markMessageAsRead|sendPresence)`,
+`^/group/`. Üstündən yalnız dəqiq (`=`) uyğunluqla deşik açılır:
+
+| endpoint | kim | qoruma |
+|---|---|---|
+| `/chat/getBase64FromMediaMessage/principal` | 165.232.72.187 | `satisfy any` — IP **və ya** parol |
+| `/message/sendText/principal` | 165.232.72.187 | IP **və** parol, `evosend` limiti (12/dəq), `/var/log/nginx/evo-send.log` |
+
+Dəqiq uyğunluq regex-dən güclü olduğu üçün `sendMedia`, `sendAudio` və digər
+xətlər (`Zemfira`, `Rouz-*`) 403 qalır. Yoxlanıb (2026-09-27): siyahıda olmayan
+IP-dən `sendText` 403, siyahıdakı IP üçün parol qapısına çatır, `sendMedia` isə
+hər halda 403.
+
+---
+
 ## Köməkçi skriptlər
 
 ### `scripts/send-message.sh`
