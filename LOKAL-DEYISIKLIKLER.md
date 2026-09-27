@@ -71,6 +71,23 @@ dəstədəki qalan mesajları buraxırdı. İndi onlar yalnız bu metoddan çıx
 ona görə «sending reupload media request…» görünür. Bu gözləmənin öz vaxt həddi
 yoxdur.
 
+## Köməkçi skriptlər
+
+### `scripts/send-message.sh`
+
+Əl ilə mesaj göndərmə yoxlaması (upstream koduna toxunmur). Açarı `.env`-dən
+özü oxuyur, terminala çap etmir; `--dry` ilə yalnız payload-u göstərir.
+
+```bash
+scripts/send-message.sh principal 994XXXXXXXXX "salam" --dry
+```
+
+`delay`/`presence` qəsdən verilmir — qarşı tərəf «yazır...» görmür və söhbət
+oxunmuş işarələnmir (oxunmuş işarəsi yalnız instance ayarındakı
+`readMessages`/`readStatus` `true` olanda baş verir, hər 4 instance-da `false`).
+
+---
+
 ## Klonlayarkən
 
 Repoda `evolution-manager-v2` submodulu var (idarəetmə paneli, ayrıca açıq
