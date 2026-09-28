@@ -92,6 +92,37 @@ hər halda 403.
 
 ---
 
+## Arxiv bayrağı (`Chat.archived`)
+
+Baileys arxivlənmiş söhbəti `chats.update` hadisəsində onsuz da göndərir
+(`{ id, archived }` — app-state sinxronizasiyası, `Utils/chat-utils.ts`
+`archiveChatAction`). Evolution isə `Chat` cədvəlində yalnız
+`remoteJid`/`name`/`unreadMessages` saxlayır, qalanını atırdı.
+
+Nəticə kənar tətbiqdə görünürdü: katibe.online söhbət siyahısında sahibin
+telefonda arxivlədiyi yüzlərlə qrup adi söhbət kimi dururdu və ekran
+WhatsApp Desktop-dakından tamam fərqli idi.
+
+Dəyişən üç yer:
+
+- `prisma/*-schema.prisma` — `Chat.archived Boolean @default(false)`;
+- `prisma/*-migrations/20260928190000_add_chat_archived/` — sütun;
+- `whatsapp.baileys.service.ts`:
+  - `chats.upsert` — yeni söhbət yaradılanda `archived` da yazılır;
+  - `chats.update` — `archived` gələndə UPSERT olunur. Update yox, upsert:
+    mesajı olan söhbətlərin bir hissəsinin `Chat` sətri ümumiyyətlə yoxdur
+    və məhz arxivlənmişlər belədir.
+
+**Köhnə arxivlər geri gəlmir.** Baileys app-state-i artımla sinxronlaşdırır:
+saxlanılan versiyadan sonrakı patch-ləri alır. Bu günə qədər arxivlənmiş
+söhbətlərin patch-i çoxdan tətbiq olunub (və Evolution onu atıb), yəni
+yenidən başlatmaq onları gətirmir. Bundan SONRA telefonda arxivlənən hər
+söhbət düşür. Tam siyahı üçün `app-state-sync-version-*` açarlarını
+Redis-dən silmək (sessiyanın özünə toxunmadan) və yenidən qoşulmaq lazımdır
+— bu, ayrıca qərardır.
+
+---
+
 ## Köməkçi skriptlər
 
 ### `scripts/send-message.sh`

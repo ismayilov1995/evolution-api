@@ -131,6 +131,9 @@ model Chat {
   Instance       Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId     String
   unreadMessages Int       @default(0)
+  // LOKAL: telefonda arxivlənmiş söhbət. Baileys onu `chats.update`-də
+  // göndərir (app-state sinxronizasiyası), Evolution isə saxlamırdı.
+  archived       Boolean   @default(false)
 
   @@unique([instanceId, remoteJid])
   @@index([instanceId])

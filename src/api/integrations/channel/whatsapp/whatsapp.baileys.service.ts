@@ -801,6 +801,10 @@ export class BaileysStartupService extends ChannelStartupService {
           instanceId: this.instanceId,
           name: chat.name,
           unreadMessages: chat.unreadCount !== undefined ? chat.unreadCount : 0,
+          // LOKAL: telefonda arxivlənmiş söhbət. Baileys bunu onsuz da
+          // göndərirdi, Evolution isə atırdı — nəticədə kənar tətbiq
+          // (katibe.online) yüzlərlə arxiv qrupunu siyahıda göstərirdi.
+          archived: (chat as unknown as { archived?: boolean }).archived === true,
         }));
 
       this.sendDataWebhook(Events.CHATS_UPSERT, chatsToInsert);
@@ -829,6 +833,29 @@ export class BaileysStartupService extends ChannelStartupService {
           where: { instanceId: this.instanceId, remoteJid: chat.id, name: chat.name },
           data: { remoteJid: chat.id },
         });
+
+        /*
+         * LOKAL: arxiv vəziyyəti.
+         *
+         * Baileys app-state sinxronizasiyasında hər arxivlənmiş/arxivdən
+         * çıxarılmış söhbət üçün `{ id, archived }` göndərir (Utils/
+         * chat-utils.ts: archiveChatAction). Yuxarıdakı updateMany onu
+         * saxlamır — üstəlik onun `where`-i `name`-ə bağlıdır, yəni ad
+         * uyğun gəlməyəndə heç bir sətir yenilənmir.
+         *
+         * UPSERT, update DEYİL: mesajı olan söhbətlərin bir hissəsinin
+         * `Chat` sətri ümumiyyətlə yoxdur, və məhz arxivlənmişlər belədir
+         * (onlar siyahının aşağısındadır, upsert isə yalnız yeni gələn
+         * söhbətlər üçün işləyir). Sətir yoxdursa yaradılır.
+         */
+        const archived = (chat as unknown as { archived?: boolean }).archived;
+        if (typeof archived === 'boolean' && chat.id) {
+          await this.prismaRepository.chat.upsert({
+            where: { instanceId_remoteJid: { instanceId: this.instanceId, remoteJid: chat.id } },
+            create: { instanceId: this.instanceId, remoteJid: chat.id, archived },
+            update: { archived },
+          });
+        }
       }
     },
 
