@@ -92,6 +92,25 @@ hər halda 403.
 
 ---
 
+## `.env` sahibliyi — xidmət onu OXUYA BİLMƏLİDİR
+
+Xidmət `evolution` istifadəçisi altında işləyir (`systemctl cat evolution-api`),
+`.env` isə `600`-dür. Faylı `root` altında `cp`/`mv` ilə əvəz etmək sahibliyi
+`root`-a keçirir və xidmət onu oxuya bilmir: Prisma
+`DATABASE_CONNECTION_URI`-ni tapmır, proses qalxmır, systemd isə sonsuz
+yenidən başlatmağa girir.
+
+2026-09-29-da məhz belə oldu: `LOG_BAILEYS` müvəqqəti dəyişdirilib
+`mv .env.bak .env` ilə geri qaytarıldı və dörd nömrə **14 dəqiqə** (04:53–05:07
+UTC) qopdu. Mesaj itmədi — WhatsApp növbəyə yığıb qoşulandan sonra çatdırdı —
+amma panel həmin müddətdə kor idi.
+
+Qayda: `.env`-ə toxunandan sonra HƏMİŞƏ
+`chown evolution:evolution .env && chmod 600 .env`. Redaktə üçün `mv` yox,
+`sed -i` işlət — o, sahibliyi saxlayır.
+
+---
+
 ## Arxiv bayrağı (`Chat.archived`)
 
 Baileys arxivlənmiş söhbəti `chats.update` hadisəsində onsuz da göndərir
