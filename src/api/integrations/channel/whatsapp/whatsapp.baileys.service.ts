@@ -368,7 +368,25 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+  private async connectionUpdate({
+    qr,
+    connection,
+    lastDisconnect,
+    receivedPendingNotifications,
+  }: Partial<ConnectionState>) {
+    /*
+     * LOKAL: app-state sinxronizasiyası məhz BU siqnaldan sonra başlayır.
+     *
+     * Əvvəl `connection === 'open'` anında çağırılırdı və heç nə gətirmirdi:
+     * soket hələ `w:sync:app:state` sorğusuna hazır deyil. Baileys özü də
+     * eyni şərti gözləyir (`Socket/chats.ts`: `if (!receivedPendingNotifications
+     * || syncState !== SyncState.Connecting) return`), ona görə düzgün siqnal
+     * budur, `open` deyil.
+     */
+    if (receivedPendingNotifications) {
+      this.resyncAppState();
+    }
+
     if (qr) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
@@ -783,6 +801,58 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString());
     }
+  }
+
+  /**
+   * LOKAL: app-state (arxiv, pin, səssiz, oxunmuş nişanı) sinxronizasiyası.
+   *
+   * NİYƏ ƏL İLƏ ÇAĞIRILIR. Baileys `resyncAppState`-i yalnız TARİXÇƏ
+   * sinxronizasiyasının bir hissəsi kimi işə salır (`Socket/chats.ts`:
+   * `doAppStateSync` → yalnız `syncState === Syncing` olanda). Tarixçə
+   * bildirişi isə adətən yalnız ilk cütləşmədə (QR) gəlir; mövcud sessiya
+   * yenidən qoşulanda gəlmir. Nəticədə telefonun vəziyyəti HEÇ VAXT
+   * oxunmurdu.
+   *
+   * Sübut (2026-09-28, Redis): dörd işlək nömrənin hər birində yalnız
+   * `app-state-sync-version-critical_block` var; arxivin daşındığı
+   * `regular_high` və `regular` kolleksiyalarının versiyası ümumiyyətlə
+   * yoxdur — yəni onlar heç vaxt çəkilməyib.
+   *
+   * İLK ÇAĞIRIŞ BÖYÜKDÜR, sonrakılar kiçik: versiya yadda saxlanılır və
+   * növbəti dəfə yalnız fərq gəlir. Ona görə hər qoşulmada çağırılır —
+   * Evolution söndürülü ikən telefonda arxivlənən söhbət də beləcə düşür.
+   *
+   * HEÇ NƏ GÖNDƏRMİR. Bu, yalnız oxuma yoludur: gələn patch-lər
+   * `chats.update`/`contacts.upsert` hadisələrinə çevrilir. Oxunmuş
+   * nişanı da YALNIZ telefondan bizə gəlir, əksinə yox.
+   *
+   * BİR PROSESDƏ BİR DƏFƏ. Ölçüldü (2026-09-29): bu hesablarda köhnə
+   * app-state anlıq şəkli `bad decrypt` verir — əlimizdəki
+   * `app-state-sync-key-*` açarları həmin şəkli açmır (telefon onları
+   * yalnız cütləşmə anında paylaşır). Baileys belə halda versiyanı silib
+   * yenidən cəhd edir; hər qoşulmada təkrarlamaq eyni nəticəsiz işi
+   * təkrarlamaq olardı. Yeni patch-lər onsuz da canlı bildirişlə gəlir.
+   */
+  private appStateSynced = false;
+
+  private resyncAppState(): void {
+    if (this.appStateSynced) return;
+    this.appStateSynced = true;
+
+    const client = this.client as unknown as {
+      resyncAppState?: (names: string[], isInitial: boolean) => Promise<void>;
+    };
+    if (typeof client.resyncAppState !== 'function') return;
+
+    // Fon işidir: qoşulma axını onu gözləməməlidir.
+    void client
+      .resyncAppState(['critical_block', 'critical_unblock_low', 'regular_high', 'regular', 'regular_low'], true)
+      .then(() => this.logger.info(`app-state sinxronlaşdı: ${this.instance.name}`))
+      .catch((error) =>
+        // Alınmasa heç nə pozulmur: vəziyyət köhnə qalır, növbəti qoşulmada
+        // yenidən cəhd olunur.
+        this.logger.warn(`app-state sinxronlaşmadı (${this.instance.name}): ${error?.message ?? error}`),
+      );
   }
 
   private readonly chatHandle = {
